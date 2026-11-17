@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "safe_mode": true,
+  "default_source": "lab",
+  "token_file": "/path/to/.tokens",
+  "token_sync_target": ".spm/token",
+  "sources": {
+    "lab": {
+      "type": "github",
+      "repo": "Cool-zimo/github-skills-lab",
+      "ref": "main",
+      "path": "downloads",
+      "pattern": "github-skills.v.*.zip"
+    },
+    "review": {
+      "type": "pr",
+      "repo": "Cool-zimo/github-skills-lab",
+      "number": 1,
+      "path": "downloads"
+    },
+    "local": { "type": "path", "path": "./examples/hello-skill" }
+  },
+  "aliases": {
+    "v12": "run github-skills@1.2.0 check",
+    "v13": "run github-skills@1.3.0 check"
+  },
+  "scripts": {
+    "check": "python3 github --help",
+    "test": "python3 -m unittest discover -s tests -q"
+  }
+}
