@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""skillpm · GitHub skill 包管理器（零第三方依赖，Python 3.8+）
+
+    python3 spm doctor
+    python3 spm source list
+    python3 spm install github-skills@1.2.0 --trust --allow python3
+    python3 spm install github-skills@1.3.0 --from pr:Cool-zimo/github-skills-lab#1 --trust
+    python3 spm use github-skills@1.2.0
+    python3 spm alias add gs "exec github-skills -- python3 github --help"
+    python3 spm gs
+"""
+import argparse
+import json
+import os
+import shlex
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from spmlib import _gh, aliases, config, fetch, sandbox, sources, tokens, versions  # noqa: E402
+
+VERSION = "1.0.0"
+COMMANDS = {
+    "doctor", "source", "install", "list", "show", "use", "uninstall",
+    "trust", "untrust", "safe", "mode", "allow", "dir", "verify",
+    "run", "exec", "vfs", "script", "alias", "token",
+}
+
+
+def out(*a, **kw):
+    print(*a, **kw)
+
+
+def die(e):
+    print("❌ %s" % e, file=sys.stderr)
+    return 1
+
+
+def load():
+    return config.load()
+
+
+def token():
+    return _gh.load_token(config.PKG_ROOT)
+
+
+def vsplit(spec):
+    return versions.split(spec)
+
+
+# ---------------------------------------------------------------- source
+def cmd_source(args):
+    cfg = load()
+    if args.action == "list":
+        for n, s in sorted((cfg.get("sources") or {}).items()):
+            mark = " ← 默认" if n == cfg.get("default_source") else ""
+            out("  %-16s %s%s" % (n, sources.describe(s), mark))
+        return 0
+    if args.action == "add":
+        src = sources.parse(args.spec)
+        cfg.setdefault("sources", {})[args.name] = src
+        if args.default:
+            cfg["default_source"] = args.name
+        config.save(cfg)
+        out("✅ 源 %s → %s" % (args.name, sources.describe(src)))
+        return 0
+    if args.action == "rm":
+        if args.name not in (cfg.get("sources") or {}):
+            out("没有源 %s" % args.name, file=sys.stderr)
+            return 1
+        del cfg["sources"][args.name]
+        config.save(cfg)
+        out("✅ 已删 %s" % args.name)
+        return 0
+    if args.action == "show":
+        s = (cfg.get("sources") or {}).get(args.name)
+        if not s:
+            out("没有源 %s" % args.name, file=sys.stderr)
+            return 1
+        out(json.dumps(s, ensure_ascii=False, indent=2))
+        return 0
+
+
+# ---------------------------------------------------------------- install
+def _pick_file(src, version, filename, token):
+    if src["type"] != "github":
+        return None
+    files = sources.list_github_files(src, token)
+    if filename:
+        hit = [f for f in files if f["name"] == filename]
+        if not hit:
+            raise fetch.FetchError("源里没有文件 %s（有：%s）" %
+                                  (filename, ", ".join(f["name"] for f in files[:8])))
+        return hit[0]["name"]
+    import re
+    pat = src.get("pattern")
+    cand = []
+    for f in files:
+        if not f["name"].endswith((".zip", ".tar.gz", ".tgz", ".md", ".py")):
+            continue
+        if pat and not re.match(re.escape(pat).replace(r"\*", ".*") + "$", f["name"]):
+            continue
+        v = fetch.guess_version(f["name"])
+        if version and v != version:
+            continue
+        cand.append((v or "", f["name"]))
+    if not cand:
+        raise fetch.FetchError("没找到匹配的版本包（version=%r, pattern=%r）" %
+                               (version, pat))
+    cand.sort()
+    return cand[-1][1]
+
+
+def cmd_install(args):
+    cfg = load()
+    name, version = vsplit(args.spec)
+    src = sources.get_source(cfg, name=args.src_name, spec=args.from_spec, token=token())
+    if args.pr:
+        repo = src.get("repo") or (cfg.get("sources") or {}).get(
+            cfg.get("default_source"), {}).get("repo")
+        if not repo:
+            raise sources.SourceError("--pr 需要能推断出 owner/repo，加 --from github:owner/repo")
+        src = sources.resolve_pr({"type": "pr", "repo": repo, "number": args.pr,
+                                  "path": src.get("path", "")}, token())
+    out("源     %s" % sources.describe(src))
+    out("版本   %s@%s" % (name, version or "(自动)"))
+
+    rel = _pick_file(src, version, args.file, token()) if src["type"] == "github" else None
+    if rel:
+        out("文件   %s" % rel)
+    data = fetch.download(src, token(), rel=rel)
+    out("下载   %d 字节  sha256=%s" % (len(data), fetch.sha256(data)[:12]))
+
+    if not version:
+        version = (fetch.guess_version(rel or src.get("url", "") or src.get("path", ""))
+                   or args.as_version or "latest")
+    versions.check(name, version)
+    root = versions.root(name, version)
+    if os.path.isdir(root) and os.path.isfile(versions.meta_path(name, version)):
+        out("❌ 版本已存在：%s@%s" % (name, version), file=sys.stderr)
+        return 1
+
+    h = config.home()
+    tmp = tempfile.mkdtemp(prefix=".install.", dir=h)
+    try:
+        manifest = fetch.unpack(data, tmp)
+        config.assert_inside(h, tmp, "解包临时目录")
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        os.rename(tmp, root)
+        tmp = None
+    finally:
+        if tmp and os.path.isdir(tmp):
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    scripts = {}
+    for item in args.script or []:
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        scripts[k.strip()] = v.strip()
+    meta = versions.create(
+        name, version, src, manifest, trust=args.trust, vfs=not args.no_vfs,
+        allow=args.allow or [], scripts=scripts, pr=src.get("pr"))
+    out("✅ 已装 %s@%s  %d 文件 / %d 字节" %
+        (name, version, meta["files"], meta["bytes"]))
+    out("   目录 %s" % root)
+    out("   信任 %s  VFS %s  白名单 %s" %
+        ("✅" if meta["trusted"] else "❌", "开" if meta["vfs"] else "关",
+         ",".join(meta["allow_commands"]) or "(空=全禁)"))
+    if versions.active(name) == version:
+        out("   已设为当前版本")
+    # token 文件同步：装完自动分发一次，不打印值
+    try:
+        res = tokens.sync(cfg)
+        if res:
+            out("   token 已同步到 %d 个版本（值不显示）" % len(res))
+    except tokens.TokenError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------- versions
+def cmd_list(args):
+    cfg = load()
+    h = config.home()
+    if not os.path.isdir(h):
+        out("(还没有装任何 skill)")
+        return 0
+    found = 0
+    for name in sorted(os.listdir(h)):
+        vs = versions.versions(name, h)
+        if not vs:
+            continue
+        found += 1
+        act = versions.active(name, h)
+        out("%s  (%d 个版本)" % (name, len(vs)))
+        for v in vs:
+            m = versions.read_meta(name, v, h)
+            flags = []
+            if m.get("trusted"):
+                flags.append("trusted")
+            if m.get("vfs"):
+                flags.append("vfs")
+            if m.get("allow_commands"):
+                flags.append("allow=" + ",".join(m["allow_commands"]))
+            out("   %s %-14s %2d 文件 %7dB  %s" %
+                ("*" if v == act else " ", v, m.get("files", 0), m.get("bytes", 0),
+                 " ".join(flags)))
+    if not found:
+        out("(还没有装任何 skill)")
+    out("\n安全模式 %s | SPM_HOME %s" %
+        ("开" if config.safe_on(cfg) else "关", h))
+    return 0
+
+
+def cmd_show(args):
+    name, version = vsplit(args.spec)
+    v = versions.resolve(name, version)
+    m = versions.read_meta(name, v)
+    out(json.dumps(m, ensure_ascii=False, indent=2)[:4000])
+    return 0
+
+
+def cmd_use(args):
+    name, version = vsplit(args.spec)
+    versions.set_active(name, version)
+    out("✅ 当前版本 %s → %s@%s" % (name, name, version))
+    return 0
+
+
+def cmd_uninstall(args):
+    name, version = vsplit(args.spec)
+    v = versions.uninstall(name, version)
+    out("✅ 已卸载 %s@%s" % (name, v))
+    return 0
+
+
+def cmd_trust(args):
+    name, version = vsplit(args.spec)
+    v, t = versions.trust(name, version, args.value == "on")
+    out("✅ %s@%s  trusted=%s" % (name, v, t))
+    return 0
+
+
+def cmd_safe(args):
+    cfg = load()
+    cfg["safe_mode"] = (args.value == "on")
+    config.save(cfg)
+    out("✅ 安全模式 %s" % ("开" if cfg["safe_mode"] else "关"))
+    if not cfg["safe_mode"]:
+        out("   ⚠️  关闭后 warn 不再拦截越界检查，仅用于本地调试")
+    return 0
+
+
+def cmd_mode(args):
+    name, version = vsplit(args.spec)
+    v, m = versions.mode(name, version, args.value == "vfs")
+    out("✅ %s@%s VFS=%s" % (name, v, m))
+    return 0
+
+
+def cmd_allow(args):
+    name, version = vsplit(args.spec)
+    if args.clear:
+        v, a = versions.allow(name, version, [], replace=True)
+        out("✅ %s@%s 白名单已清空（全禁）" % (name, v))
+    else:
+        v, a = versions.allow(name, version, args.cmds, replace=args.replace)
+        out("✅ %s@%s 白名单：%s" % (name, v, ", ".join(a) or "(空)"))
+    return 0
+
+
+def cmd_dir(args):
+    name, version = vsplit(args.spec)
+    v = versions.resolve(name, version)
+    out(versions.root(name, v))
+    return 0
+
+
+def cmd_verify(args):
+    name, version = vsplit(args.spec)
+    v = versions.resolve(name, version)
+    m = versions.read_meta(name, v)
+    ok, total, bad = fetch.verify(versions.root(name, v), m.get("manifest") or {})
+    out("%s@%s ：%d/%d 一致 %s" % (name, v, ok, total, "✅" if not bad else "❌ " + str(bad[:6])))
+    return 0 if not bad else 1
+
+
+# ---------------------------------------------------------------- run / exec / vfs
+def _line(parts):
+    return " ".join(parts) if isinstance(parts, (list, tuple)) else parts
+
+
+def cmd_run(args):
+    name, version = vsplit(args.spec)
+    rc, so, se = sandbox.run_script(name, version, args.script, args.args)
+    if so:
+        out(so, end="" if so.endswith("\n") else "\n")
+    if se:
+        print(se, end="" if se.endswith("\n") else "\n", file=sys.stderr)
+    out("[rc=%d] %s@%s script=%s" % (rc, name, version or versions.active(name), args.script))
+    return rc
+
+
+def cmd_exec(args):
+    name, version = vsplit(args.spec)
+    line = _line(args.cmd)
+    rc, so, se = sandbox.run(name, version, line)
+    if so:
+        out(so, end="" if so.endswith("\n") else "\n")
+    if se:
+        print(se, end="" if se.endswith("\n") else "\n", file=sys.stderr)
+    out("[rc=%d] %s@%s exec=%r" % (rc, name, version or versions.active(name), line))
+    return rc
+
+
+def cmd_vfs(args):
+    name, version = vsplit(args.spec)
+    v = versions.resolve(name, version)
+    f = sandbox.VirtualFS(name, v)
+    if args.action == "ls":
+        for p in f.ls(args.path or "."):
+            out("  ", p)
+        return 0
+    if args.action == "cat":
+        sys.stdout.buffer.write(f.read(args.path))
+        out()
+        return 0
+    if args.action == "put":
+        p = f.write(args.path, (args.data or "").encode())
+        out("✅ 写入写层：%s" % os.path.relpath(p, config.home()))
+        return 0
+    if args.action == "root":
+        out("只读层", f.read_root)
+        out("可写层", f.write_root)
+        return 0
+
+
+def cmd_script(args):
+    cfg = load()
+    if args.action == "list":
+        for k, v in sorted((cfg.get("scripts") or {}).items()):
+            out("  %-16s %s" % (k, v))
+        out("  (版本内脚本见 spm show <name>@<ver> 的 scripts 字段)")
+        return 0
+    if args.action == "add":
+        cfg.setdefault("scripts", {})[args.key] = _line(args.cmd)
+        config.save(cfg)
+        out("✅ 全局脚本 %s → %s" % (args.key, args.cmd))
+        return 0
+    if args.action == "rm":
+        cfg.get("scripts", {}).pop(args.key, None)
+        config.save(cfg)
+        out("✅ 已删脚本 %s" % args.key)
+        return 0
+
+
+# ---------------------------------------------------------------- alias / token
+def cmd_alias(args):
+    cfg = load()
+    if args.action == "list":
+        for k, v in aliases.list_all(cfg):
+            out("  %-14s → %s" % (k, v))
+        return 0
+    if args.action == "add":
+        if args.alias in COMMANDS:
+            out("❌ 别名不能覆盖内置命令 %s" % args.alias, file=sys.stderr)
+            return 1
+        t = aliases.add(cfg, args.alias, _line(args.target))
+        out("✅ 别名 %s → %s" % (args.alias, t))
+        return 0
+    if args.action == "rm":
+        aliases.remove(cfg, args.alias)
+        out("✅ 已删别名 %s" % args.alias)
+        return 0
+
+
+def cmd_token(args):
+    cfg = load()
+    if args.action == "set":
+        cfg["token_file"] = os.path.abspath(args.path)
+        config.save(cfg)
+        out("✅ token 文件 → %s（值不显示）" % cfg["token_file"])
+        return 0
+    if args.action == "sync":
+        res = tokens.sync(cfg)
+        if not res:
+            out("(没有已装版本)")
+        for n, fresh in res:
+            out("  %-28s %s" % (n, "已同步" if fresh else "已是最新"))
+        out("✅ 共 %d 个版本，token 值全程未显示" % len(res))
+        return 0
+    if args.action == "status":
+        st = tokens.status(cfg)
+        b = st["source"]
+        out("源文件  %s" % b.get("source"))
+        if b.get("exists"):
+            out("  存在 ✅  %d 行 / %d 字节  sha12=%s  mtime=%s" %
+                (b["lines"], b["bytes"], b["sha12"], b["mtime"]))
+        else:
+            out("  ❌", b.get("error"))
+        for t in st["targets"]:
+            if t.get("missing"):
+                out("  %-28s 未同步" % t["name"])
+            else:
+                out("  %-28s sha12=%s  %s" %
+                    (t["name"], t["sha12"], "✅一致" if t.get("same") else "⚠️不同"))
+        return 0
+
+
+def cmd_doctor(args):
+    cfg = load()
+    out("=== skillpm v%s 自检 ===" % VERSION)
+    out("  SPM_HOME      %s" % config.home())
+    out("  安全模式      %s" % ("开" if config.safe_on(cfg) else "关"))
+    out("  默认源        %s" % cfg.get("default_source"))
+    out("  token 文件    %s" % cfg.get("token_file"))
+    try:
+        st = tokens.status(cfg)
+        out("  token 状态    %s（%d 行，sha12=%s，值不显示）" %
+            ("找到" if st["source"].get("exists") else "未找到",
+             st["source"].get("lines", 0), st["source"].get("sha12", "-")))
+    except Exception as e:
+        out("  token 状态    ⚠️ %s" % e)
+    n_ver = 0
+    if os.path.isdir(config.home()):
+        for n in os.listdir(config.home()):
+            if os.path.isdir(os.path.join(config.home(), n)):
+                n_ver += len(versions.versions(n))
+    out("  已装版本      %d 个" % n_ver)
+    out("  别名          %d 个" % len(cfg.get("aliases") or {}))
+    out("  全局脚本      %d 个" % len(cfg.get("scripts") or {}))
+    out("  Python        %s" % sys.version.split()[0])
+    return 0
+
+
+# ---------------------------------------------------------------- parser
+def build_parser():
+    p = argparse.ArgumentParser(prog="spm", description="GitHub skill 包管理器 v" + VERSION)
+    sub = p.add_subparsers(dest="subcmd")
+
+    def add(name, fn, help_):
+        q = sub.add_parser(name, help=help_)
+        q.set_defaults(fn=fn)
+        return q
+
+    add("doctor", cmd_doctor, "环境自检（不回显 token）")
+
+    q = add("source", cmd_source, "管理下载源")
+    q.add_argument("action", choices=["list", "add", "rm", "show"])
+    q.add_argument("name", nargs="?")
+    q.add_argument("spec", nargs="?")
+    q.add_argument("--default", action="store_true")
+
+    q = add("install", cmd_install, "下载并解包一个版本")
+    q.add_argument("spec", help="name[@version]")
+    q.add_argument("--from", dest="from_spec", help="自定义源 spec")
+    q.add_argument("--source", dest="src_name", help="命名源（默认用 default_source）")
+    q.add_argument("--pr", type=int, help="装 PR head 的版本")
+    q.add_argument("--file", help="指定源里的文件名")
+    q.add_argument("--as-version", dest="as_version", help="强制版本号")
+    q.add_argument("--trust", action="store_true", help="装完直接信任")
+    q.add_argument("--no-vfs", action="store_true", help="关闭 VFS 隔离")
+    q.add_argument("--allow", nargs="*", default=[], help="允许的命令名")
+    q.add_argument("--script", nargs="*", default=[], help="key=命令，可重复")
+
+    add("list", cmd_list, "列出所有已装版本")
+    q = add("show", cmd_show, "看版本元数据")
+    q.add_argument("spec")
+    q = add("use", cmd_use, "切换当前版本")
+    q.add_argument("spec")
+    q = add("uninstall", cmd_uninstall, "卸载版本")
+    q.add_argument("spec")
+    q = add("trust", cmd_trust, "信任/取消信任")
+    q.add_argument("spec")
+    q.add_argument("value", nargs="?", default="on", choices=["on", "off"])
+    # untrust 是独立命令，复用 cmd_trust 但强制 off
+    q = add("untrust", lambda a: cmd_trust(argparse.Namespace(spec=a.spec, value="off")), "取消信任")
+    q.add_argument("spec")
+    q = add("safe", cmd_safe, "安全模式开关")
+    q.add_argument("value", choices=["on", "off"])
+    q = add("mode", cmd_mode, "切换版本隔离模式")
+    q.add_argument("spec")
+    q.add_argument("value", choices=["vfs", "plain"])
+    q = add("allow", cmd_allow, "管理能执行的命令白名单")
+    q.add_argument("spec")
+    q.add_argument("cmds", nargs="*")
+    q.add_argument("--replace", action="store_true", help="替换而非追加")
+    q.add_argument("--clear", action="store_true")
+    q = add("dir", cmd_dir, "打印版本所在目录")
+    q.add_argument("spec")
+    q = add("verify", cmd_verify, "逐文件 sha256 校验")
+    q.add_argument("spec")
+
+    q = add("run", cmd_run, "运行自定义脚本")
+    q.add_argument("spec")
+    q.add_argument("script", nargs="?", default="default")
+    q.add_argument("args", nargs=argparse.REMAINDER)
+    q = add("exec", cmd_exec, "在隔离环境执行命令")
+    q.add_argument("spec")
+    q.add_argument("cmd", nargs=argparse.REMAINDER)
+    q = add("vfs", cmd_vfs, "虚拟文件系统：ls / cat / put / root")
+    q.add_argument("action", choices=["ls", "cat", "put", "root"])
+    q.add_argument("spec", nargs="?")
+    q.add_argument("path", nargs="?")
+    q.add_argument("data", nargs="?")
+
+    q = add("script", cmd_script, "管理全局自定义脚本")
+    q.add_argument("action", choices=["list", "add", "rm"])
+    q.add_argument("key", nargs="?")
+    q.add_argument("cmd", nargs=argparse.REMAINDER)
+    q = add("alias", cmd_alias, "管理命令别名")
+    q.add_argument("action", choices=["list", "add", "rm"])
+    q.add_argument("alias", nargs="?")
+    q.add_argument("target", nargs=argparse.REMAINDER)
+    q = add("token", cmd_token, "token 文件同步 / 状态")
+    q.add_argument("action", choices=["set", "sync", "status"])
+    q.add_argument("path", nargs="?")
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cfg = load()
+    # 别名展开发生在解析之前
+    if argv and argv[0] not in COMMANDS and argv[0] not in ("-h", "--help"):
+        expanded = aliases.resolve(cfg, argv[0], argv[1:])
+        if expanded:
+            out("↪ 别名 %s → %s" % (argv[0], " ".join(expanded)))
+            argv = expanded
+    if not argv:
+        argv = ["doctor"]
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return 1
+    if getattr(args, "subcmd", None) == "exec" and args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
+    if getattr(args, "subcmd", None) == "script" and args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
+    if getattr(args, "subcmd", None) == "run" and args.args and args.args[0] == "--":
+        args.args = args.args[1:]
+    try:
+        return args.fn(args)
+    except Exception as e:
+        return die(e)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
