@@ -1,0 +1,135 @@
+--- a/github
++++ b/github
+@@ -16,6 +16,11 @@
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ import ghlib as G
+ 
++try:
++    import sb3lib as SB3          # sb3 适配层：纯本地命令，不调用 GitHub API
++except ImportError:               # 没放 sb3lib.py 时其它命令仍可正常用
++    SB3 = None
++
+ ROOT = os.path.dirname(os.path.abspath(__file__))
+ PROJECTS = os.path.join(ROOT, "projects")
+ GUIDES = os.path.join(ROOT, "guides")
+@@ -23,6 +28,7 @@
+ COMMANDS = {
+     "whoami", "users", "use", "doctor", "tree", "status", "pr", "collab",
+     "new", "clone", "pull", "verify", "push", "sync", "ff", "guide", "pages",
++    "sb3",
+ }
+ 
+ 
+@@ -506,6 +512,91 @@
+     if args.wait:
+         print("等待落定：最终状态", G.poll_pages(i["token"], repo))
+     return 0
++
++
++# ---------------------------------------------------------------- sb3 适配
++# 全部本地执行：不解析账号、不调 GitHub API、不需要 token。
++# 与 doctor / guide 一样，匿名只读环境也能用。
++
++SB3_GUIDE = """sb3 = ZIP 包（不是代码文本）
++  project.json   程序：targets / monitors / extensions / meta
++  素材           按内容 MD5 命名，平铺在 ZIP 根目录（不能多一层文件夹）
++
++target（Stage 或 Sprite）
++  isStage name variables lists broadcasts blocks comments
++  currentCostume costumes sounds layerOrder volume
++  Sprite 另加 x y size direction visible draggable rotationStyle
++
++blocks 是图不是文本
++  ID -> {opcode, next, parent, inputs, fields, shadow, topLevel, x, y}
++  next / parent 必须双向一致；脚本从帽子块（topLevel）起步
++
++inputs 第一位是阴影状态，不是值
++  [1, X] 有阴影 / [2, id] 无阴影 / [3, id, shadowId] 阴影被覆盖
++  X 可为 blockId，或内联 primitive：
++    4 数字 5 正数 6 正整数 7 整数 8 角度 9 颜色
++    10 字符串 11 广播 12 变量 13 列表
++  例：移动 10 步 = inputs.STEPS = [1, [4, "10"]]（不是 fields！）
++  fields 用于下拉框等不能塞 reporter 的位置，格式 [值, id或null]
++
++资源对象
++  assetId + name + md5ext + dataFormat
++  造型再加 rotationCenterX/Y、bitmapResolution；声音再加 rate / sampleCount
++  md5ext = assetId + "." + dataFormat，assetId 通常就是文件内容 MD5
++  SVG 建议带 xmlns 与 viewBox，缺 viewBox 常被渲染成问号
++
++常见翻车
++  1 素材没平铺 -> 导入成功但角色是问号
++  2 next/parent 断链 -> 能导入但脚本不跑
++  3 把 fields 和 inputs 搞混 -> 空槽
++  4 用了扩展积木却没写 extensions -> 被静默丢弃
++  5 变量 ID 在 variables / fields / monitors.id 三处没对齐 -> 监视器乱码
++  6 自定义积木 mutation 漏写 proccode / argumentids -> 定义失效
++"""
++
++
++def cmd_sb3(args):
++    if SB3 is None:
++        raise G.GhError("找不到 sb3lib.py：请把它放在与 github 同一目录")
++    a = args.sb3_cmd
++    if a == "check":
++        errors, warnings, info, code = SB3.check(args.file)
++        if args.json:
++            print(json.dumps({"ok": code == 0, "info": info,
++                              "warnings": warnings, "errors": errors},
++                             ensure_ascii=False, indent=2))
++        else:
++            for x in info:
++                print("  · " + x)
++            for w in warnings:
++                print("  ⚠ 警告: " + w)
++            for e in errors:
++                print("  ❌ 错误: " + e)
++            print("=== 结果: %s（错误 %d / 警告 %d）===" %
++                  ("通过" if code == 0 else "未通过", len(errors), len(warnings)))
++        return 0 if code == 0 else 1
++    if a == "tree":
++        for line in SB3.tree(args.file):
++            print(line)
++        return 0
++    if a == "unpack":
++        n = SB3.unpack(args.file, args.dir)
++        print("✅ 解包 %s → %s（%d 个文件）" % (args.file, args.dir, n))
++        return 0
++    if a == "pack":
++        lines, code = SB3.pack(args.dir, args.out)
++        for line in lines:
++            print(line)
++        return 0 if code == 0 else 1
++    if a == "make":
++        lines, code = SB3.make(args.out)
++        for line in lines:
++            print(line)
++        return 0 if code == 0 else 1
++    if a == "guide":
++        print(SB3_GUIDE)
++        return 0
++    raise G.GhError("未知 sb3 子命令：%s" % a)
+ 
+ 
+ def build_parser():
+@@ -577,6 +668,20 @@
+     q = add("guide", cmd_guide, help="打印 guides/ 下任意文档（--list 看全部）")
+     q.add_argument("which", nargs="?", default="使用指南.md")
+     q.add_argument("--list", action="store_true", help="列出 guides/ 下所有文档")
++    # sb3 适配：本地命令组，不解析账号、不调 API、不需要 token
++    q = add("sb3", cmd_sb3, help="sb3 工具：check / tree / unpack / pack / make / guide")
++    s3 = q.add_subparsers(dest="sb3_cmd", required=True)
++    c = s3.add_parser("check", help="结构校验任意 .sb3")
++    c.add_argument("file"); c.add_argument("--json", action="store_true", help="机器可读输出")
++    c = s3.add_parser("tree", help="包内清单 + targets/blocks 概览")
++    c.add_argument("file")
++    c = s3.add_parser("unpack", help="解包成可编辑目录")
++    c.add_argument("file"); c.add_argument("dir", nargs="?", default="sb3_unpacked")
++    c = s3.add_parser("pack", help="目录 → sb3（自动重算 MD5、平铺、自检）")
++    c.add_argument("dir"); c.add_argument("-o", "--out", required=True)
++    c = s3.add_parser("make", help="生成可导入的最小示例 sb3")
++    c.add_argument("out", nargs="?", default="最小示例.sb3")
++    s3.add_parser("guide", help="打印 sb3 结构速查（内置，离线可用）")
+     return p
+ 
+ 
