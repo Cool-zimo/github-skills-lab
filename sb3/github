@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""github —— GitHub 操作 skill 的唯一入口。python3 github <命令> [参数]
+
+多账号：账号 = .tokens 的一行。切换方式（优先级从高到低）
+  --as <login|行号>   ·   github as <账号> <命令>   ·   github <账号> <命令>
+  ·   .active（github use 设定）   ·   默认第 1 行
+每个命令只做一件事，输出可直接被 Agent 读；写操作都支持 --dry-run。
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ghlib as G
+
+try:
+    import sb3lib as SB3          # sb3 适配层：纯本地命令，不调用 GitHub API
+except ImportError:               # 没放 sb3lib.py 时其它命令仍可正常用
+    SB3 = None
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECTS = os.path.join(ROOT, "projects")
+GUIDES = os.path.join(ROOT, "guides")
+
+COMMANDS = {
+    "whoami", "users", "use", "doctor", "tree", "status", "pr", "collab",
+    "new", "clone", "pull", "verify", "push", "sync", "ff", "guide", "pages",
+    "sb3",
+}
+
+
+def lift_as(argv):
+    """把三种账号前缀改写成一个 --as 参数，放在末尾（每个子命令都认）。"""
+    if not argv:
+        return argv
+    if argv[0] in ("--as", "as") and len(argv) >= 3:
+        return argv[2:] + ["--as", argv[1]]
+    if not argv[0].startswith("-") and argv[0] not in COMMANDS and len(argv) >= 2:
+        try:
+            names = {a[1] for a in G.accounts(ROOT) if a[5] == "ok"}
+            if argv[0] in names:
+                return argv[1:] + ["--as", argv[0]]
+        except G.GhError:
+            pass
+    return argv
+
+
+def ident(args, allow_anon=False):
+    spec = getattr(args, "as_spec", None)
+    if spec is None and getattr(args, "line", 1) != 1:
+        spec = args.line
+    return G.resolve(ROOT, spec, allow_anonymous=allow_anon)
+
+
+def tok(args):
+    return ident(args)["token"]
+
+
+def who(i):
+    return "%s (第 %d 行)" % (i["login"], i["line"])
+
+
+def guard(i, repo_full):
+    """写操作前置：打印身份 + 查目标仓库 push 权限。"""
+    print("身份   %s" % who(i))
+    if not i["token"]:
+        raise G.GhError("写操作需要 .tokens（当前是匿名只读身份）")
+    perm = G.precheck_push(i, repo_full)
+    print("权限   push=%s admin=%s → %s" % (perm.get("push"), perm.get("admin"), repo_full))
+    return perm
+
+
+def ghproj_write(dest, repo, branch=None, commit=None):
+    """写一行 JSON：仓库全名 + 默认分支 + 最近 commit。v1.2.0 的纯文本仍能读。"""
+    meta = {"repo": repo}
+    if branch:
+        meta["branch"] = branch
+    if commit:
+        meta["commit"] = commit
+    with open(os.path.join(dest, ".ghproj"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+
+def ghproj_find(start):
+    """返回 (meta dict, 文件路径)。兼容 v1.2.0 的纯仓库名文本。"""
+    p = os.path.abspath(start if os.path.isdir(start) else os.path.dirname(start))
+    while True:
+        f = os.path.join(p, ".ghproj")
+        if os.path.isfile(f):
+            with open(f, encoding="utf-8") as fh:
+                raw = fh.read().strip()
+            if raw.startswith("{"):
+                try:
+                    meta = json.loads(raw)
+                except ValueError:
+                    meta = {"repo": raw}
+            else:
+                meta = {"repo": raw}
+            return meta, f
+        if p in (ROOT, PROJECTS) or os.path.dirname(p) == p:
+            return None, None
+        p = os.path.dirname(p)
+
+
+def only_project(start=None):
+    """包根跑 status 时，若 projects/ 下恰好一个带 .ghproj 的项目，自动选中。"""
+    if not os.path.isdir(PROJECTS):
+        return None
+    found = []
+    for name in sorted(os.listdir(PROJECTS)):
+        f = os.path.join(PROJECTS, name, ".ghproj")
+        if os.path.isfile(f):
+            found.append(f)
+    return found[0] if len(found) == 1 else None
+
+
+def resolve_repo(args, i):
+    """仓库全名：显式参数 > 目标目录的 .ghproj > projects/ 下唯一项目；短名按当前账号补全。"""
+    r = getattr(args, "repo", None)
+    meta = None
+    if not r:
+        hint = getattr(args, "dir", None) or getattr(args, "file", None) or os.getcwd()
+        meta, src = ghproj_find(hint)
+        if not meta:
+            auto = only_project()
+            if auto:
+                meta, src = ghproj_find(auto)
+                print("仓库   %s（自动选中 projects/ 下唯一项目 %s）" %
+                      (meta.get("repo"), src))
+        if not meta:
+            raise G.GhError("没给仓库名，目标目录也没有 .ghproj（clone/pull 下来的会自动带）")
+        r = meta.get("repo")
+        if not getattr(args, "_repo_printed", False):
+            print("仓库   %s（来自 %s）" % (r, src))
+    if "/" not in r:
+        if not i.get("token") and i["login"] == "(anonymous)":
+            raise G.GhError("匿名只读模式下短名无法补全，请写全 owner/repo")
+        r = i["login"] + "/" + r
+        print("仓库   %s（短名按当前账号补全）" % r)
+    return r
+
+
+def ref_of(args, key="ref", fallback="main"):
+    """分支：显式参数 > .ghproj 里的 default_branch > main。"""
+    v = getattr(args, key, None)
+    if v:
+        return v
+    hint = getattr(args, "dir", None) or getattr(args, "repo", None) or os.getcwd()
+    meta, _ = ghproj_find(hint)
+    return (meta or {}).get("branch") or fallback
+
+
+# ---- 账号 ----
+def cmd_whoami(args):
+    i = ident(args)
+    print("当前账号 %s" % who(i))
+    print("  id     :", i["id"])
+    print("  scopes :", ", ".join(i["scopes"]) or "(响应未带)")
+    print("  token  : %s（值不显示）" % os.path.basename(i["source"]))
+    print("  默认   :", G.read_active(ROOT) or "(未设 .active → 第 1 行)")
+
+
+def cmd_users(args):
+    active = G.read_active(ROOT)
+    cur = ident(args)
+    print("=== 账号（.tokens 每行一个，值不显示）===")
+    for line, login, uid, typ, scopes, state in G.accounts(ROOT):
+        mark = " ← 当前" if line == cur["line"] else ""
+        star = "*" if active and str(active) in (login, str(line)) else " "
+        if state != "ok":
+            print(" %s 第 %d 行  %-18s %s%s" % (star, line, login, state, mark))
+            continue
+        extra = ""
+        if args.repo:
+            t, _ = G.load_token(ROOT, line)
+            st, d = G.req("GET", "/repos/" + args.repo, t)
+            if st == 200:
+                p = d.get("permissions") or {}
+                extra = "  %s: push=%s admin=%s" % (args.repo.split("/")[-1],
+                                                   p.get("push"), p.get("admin"))
+            else:
+                extra = "  %s: HTTP %s" % (args.repo.split("/")[-1], st)
+        print(" %s 第 %d 行  %-18s id=%-10s %-8s scopes=%s%s%s" %
+              (star, line, login, uid, typ, ",".join(scopes) or "-", extra, mark))
+    print("  * = .active 设定的默认账号；--as 可单次覆盖")
+    print("  切换：github use <账号>   单次：github as <账号> push ...")
+
+
+def cmd_use(args):
+    if args.clear:
+        G.write_active(ROOT, None)
+        print("✅ 已清除 .active，回到默认第 1 行")
+        return 0
+    i = G.resolve(ROOT, args.spec)
+    G.write_active(ROOT, i["login"])
+    print("✅ 默认账号设为 %s（第 %d 行）" % (i["login"], i["line"]))
+    print("   写入 .active，只存 login，不存 token")
+    return 0
+
+
+def cmd_doctor(args):
+    print("=== 环境自检 ===")
+    try:
+        i = ident(args, allow_anon=True)
+        print("  ✅ 当前账号：%s" % who(i))
+    except G.GhError as e:
+        print("  ❌ 账号解析：", e)
+        return 1
+    if i["token"]:
+        print("  ✅ .tokens：%s（%d 行）" % (i["source"], len(G.token_lines(ROOT))))
+    else:
+        print("  ℹ️  匿名只读模式（未找到 .tokens）：只读命令可用，写命令需要 .tokens")
+    print("  %s projects/ 可写：%s" % ("✅" if os.access(PROJECTS, os.W_OK) else "❌", PROJECTS))
+    for f in ("SKILL.md", "AGENTS.md", "README.md", "ghlib.py",
+              "guides/使用指南.md", "guides/踩坑记录.md", "guides/karpathy/CLAUDE.md"):
+        print("  %s %s" % ("✅" if os.path.isfile(os.path.join(ROOT, f)) else "❌", f))
+    print("  .active：", G.read_active(ROOT) or "(未设)")
+    print("  GH_EXPECT_LOGIN：", os.environ.get("GH_EXPECT_LOGIN") or "(未设，不强校验)")
+    try:
+        core = G.rate_limit(i["token"])
+        print("  API 配额：%s / %s（reset %s）" %
+              (core.get("remaining", "?"), core.get("limit", "?"),
+               time.strftime("%H:%M:%S", time.localtime(core.get("reset", 0)))))
+    except G.GhError as e:
+        print("  ⚠️  读取 /rate_limit 失败：", e)
+    return 0
+
+
+# ---- 只读 ----
+def cmd_tree(args):
+    i = ident(args, allow_anon=True)
+    repo = resolve_repo(args, i)
+    ref = ref_of(args)
+    items = G.tree(i["token"], repo, ref)
+    blobs = [t for t in items if t["type"] == "blob"]
+    print("%s @%s ：%d 项 / %d 文件 / %d 字节" %
+          (repo, ref, len(items), len(blobs), sum(t.get("size", 0) for t in blobs)))
+    for t in blobs[:args.limit]:
+        print("  %-64s %8d  %s" % (t["path"], t.get("size", 0), t["sha"][:10]))
+    if len(blobs) > args.limit:
+        print("  ... 还有 %d 个（--limit 调大）" % (len(blobs) - args.limit))
+
+
+def cmd_status(args):
+    i = ident(args, allow_anon=True)
+    repo = resolve_repo(args, i)
+    t = i["token"]
+    d = G.repo(t, repo)
+    p = d.get("permissions") or {}
+    print("仓库   %s  [%s] default=%s  size=%sKB" %
+          (d["full_name"], "private" if d["private"] else "public", d["default_branch"], d["size"]))
+    print("我的权限 push=%s admin=%s pull=%s" % (p.get("push"), p.get("admin"), p.get("pull")))
+    print("更新   %s  open_issues=%s forks=%s stars=%s" %
+          (d["pushed_at"], d["open_issues_count"], d["forks_count"], d["stargazers_count"]))
+    st, pg = G.pages(t, repo)
+    if st == 200:
+        print("Pages  %s → %s  branch=%s" %
+              (pg.get("status"), pg.get("html_url"), (pg.get("source") or {}).get("branch")))
+        st2, b = G.latest_build(t, repo)
+        print("构建   %s commit=%s err=%s" %
+              (b.get("status"), str(b.get("commit"))[:12], (b.get("error") or {}).get("message")))
+    else:
+        print("Pages  (未启用 / HTTP %s)" % st)
+
+
+def cmd_pr(args):
+    for p in G.pulls(ident(args, allow_anon=True)["token"], args.repo, args.state):
+        labels = ", ".join(x["name"] for x in p.get("labels", []))
+        print("#%-6s %-9s %-10s %s" % (p["number"], p["state"],
+              ("merged" if p.get("merged") else "-"), p["title"][:70]))
+        print("        author=%s mergeable=%s labels=[%s]" %
+              (p["user"]["login"], p.get("mergeable"), labels))
+
+
+def cmd_collab(args):
+    for c in G.collaborators(ident(args, allow_anon=True)["token"], args.repo):
+        perm = c.get("permissions") or {}
+        print("  %-18s admin=%-5s push=%-5s pull=%s" %
+              (c["login"], perm.get("admin"), perm.get("push"), perm.get("pull")))
+
+
+# ---- 落地 ----
+def cmd_new(args):
+    i = ident(args, allow_anon=True)
+    if not i["token"]:
+        raise G.GhError("建仓需要 .tokens（当前是匿名只读身份）")
+    owner = args.owner or i["login"]
+    full = "%s/%s" % (owner, args.name)
+    print("身份   %s" % who(i))
+    print("★ 将建仓  %s  ★  private=%s auto_init=%s" %
+          (full, args.private, not args.no_init))
+    if args.dry_run:
+        print("DRY-RUN：未调用 API")
+        return 0
+    d = G.create_repo(i["token"], args.name, args.private, args.desc or "",
+                      not args.no_init, owner=args.owner, login=i["login"])
+    print("✅ 已建 %s" % d["html_url"])
+    dest = os.path.join(PROJECTS, args.name)
+    r = cmd_pull(argparse.Namespace(repo=full, dir=dest, ref=d["default_branch"],
+                                    branch=d["default_branch"], line=1,
+                                    as_spec=i["login"], force=False, zip=False))
+    if r:
+        return r
+    if args.pages:
+        G.pages_enable(i["token"], full, d["default_branch"], "/")
+        print("✅ Pages 已开启 → https://%s.github.io/%s/" % (owner.lower(), args.name))
+        G.poll_pages(i["token"], full)
+    return 0
+
+
+def _pull(args, dest):
+    if os.path.isdir(dest) and os.listdir(dest) and not getattr(args, "force", False):
+        raise G.GhError("目标目录非空：%s（加 --force 覆盖）" % dest)
+    os.makedirs(dest, exist_ok=True)
+    ref = ref_of(args)
+    token = ident(args, allow_anon=True)["token"]
+    if getattr(args, "zip", False):
+        n, size, shas, status = G.pull_repo_zip(token, args.repo, dest, ref)
+        print("✅ %s @%s → %s（zipball 一次拉取）" % (args.repo, ref, dest))
+        print("   %d 文件 / %d 字节" % (n, size))
+        if status != "verified":
+            print("   ⚠️  tree 被截断，无法逐字节校验；文件已落盘，请分目录拉或用 --strict")
+            ghproj_write(dest, args.repo, ref)
+            return 0
+    else:
+        n, size, shas = G.pull_repo(token, args.repo, dest, ref)
+        print("✅ %s @%s → %s" % (args.repo, ref, dest))
+        print("   %d 文件 / %d 字节，tree 未截断" % (n, size))
+    ok, total, bad = G.verify_mirror(dest, shas)
+    print("   逐字节校验 %d/%d %s" % (ok, total, "✅" if not bad else "❌ " + str(bad[:5])))
+    ghproj_write(dest, args.repo, ref)
+    return 0 if not bad else 1
+
+
+def cmd_pull(args):
+    i = ident(args, allow_anon=True)
+    args.repo = resolve_repo(args, i)
+    dest = args.dir or os.path.join(PROJECTS, args.repo.split("/")[-1])
+    return _pull(args, dest)
+
+
+def cmd_clone(args):
+    i = ident(args, allow_anon=True)
+    args.repo = resolve_repo(args, i)
+    dest = args.dir or os.path.join(PROJECTS, args.repo.split("/")[-1])
+    url = "https://github.com/%s.git" % args.repo
+    print("先试 git clone：%s" % url)
+    p = subprocess.run(["git", "clone", "--depth", "1", url, dest],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        print("✅ clone 成功 → %s" % dest)
+        ghproj_write(dest, args.repo, ref_of(args))
+        return 0
+    last = (p.stderr.strip().splitlines() or ["unknown"])[-1]
+    print("   clone 失败（%s），回退 API 镜像" % last[:120])
+    import shutil
+    shutil.rmtree(dest, ignore_errors=True)
+    return _pull(argparse.Namespace(repo=args.repo, dir=dest, ref=ref_of(args),
+                                    line=getattr(args, "line", 1),
+                                    as_spec=getattr(args, "as_spec", None),
+                                    force=True, zip=getattr(args, "zip", False)))
+
+
+def cmd_verify(args):
+    i = ident(args, allow_anon=True)
+    repo = resolve_repo(args, i)
+    ref = ref_of(args)
+    shas = {t["path"]: t["sha"] for t in G.tree(i["token"], repo, ref)
+            if t["type"] == "blob"}
+    ignore = set()
+    if not args.strict:
+        local = set(G.walk_files(args.dir))
+        ignore = set(shas) - local
+        if ignore:
+            print("   · 线上多出 %d 个文件（合并语义正常保留，--strict 可严格比对）" % len(ignore))
+    ok, total, bad = G.verify_mirror(args.dir, shas, ignore_extra=ignore)
+    print("%s vs %s@%s ：%d/%d 一致" % (args.dir, repo, ref, ok, total))
+    if bad:
+        print("  不一致：", bad[:10])
+        return 1
+    print("  ✅ 逐字节一致")
+    return 0
+
+
+# ---- 写 ----
+def cmd_push(args):
+    i = ident(args, allow_anon=True)
+    repo = resolve_repo(args, i)
+    guard(i, repo)
+    print("推送   %s → %s:%s  -m %r" % (args.file, args.branch, args.path, args.message))
+    if args.dry_run:
+        print("DRY-RUN：未调用 API")
+        return 0
+    sha = G.put_file(i["token"], repo, args.path, args.file, args.message,
+                     ref_of(args, "branch"))
+    print("✅ commit %s" % sha[:12])
+    return 0
+
+
+def cmd_sync(args):
+    """一条龙核心：整目录 → 一次 commit → 自动逐字节校验。"""
+    if not os.path.isdir(args.dir):
+        raise G.GhError("目录不存在：%s" % args.dir)
+    i = ident(args, allow_anon=True)
+    repo = resolve_repo(args, i)
+    branch = ref_of(args, "branch")
+    if args.repo:
+        ghproj_write(args.dir, repo, branch)
+    guard(i, repo)
+    print("同步   %s → %s@%s  -m %r" % (args.dir, repo, branch, args.message))
+    r = G.sync_tree(i["token"], repo, args.dir, args.message, branch,
+                    args.dry_run, args.mirror)
+    print("   文件 %d（改动 %d / 复用 %d）· %s" %
+          (len(r["files"]), len(r["changed"]), len(r["reused"]),
+           "镜像模式" if args.mirror else "合并模式（默认）"))
+    for rel in r["changed"]:
+        print("   ~", rel)
+    if args.mirror and r["removed"]:
+        print("   ⚠️  镜像模式：以下 %d 个线上文件将被删除" % len(r["removed"]))
+        for rel in r["removed"]:
+            print("   -", rel)
+    elif r["kept"]:
+        print("   · 线上多出 %d 个文件将保留（--mirror 才会删）" % len(r["kept"]))
+        for rel in r["kept"][:5]:
+            print("   · ", rel)
+    if args.dry_run:
+        print("DRY-RUN：未调用写 API")
+        return 0
+    if r["noop"]:
+        print("   已是最新，未产生提交")
+        return 0
+    print("✅ commit %s" % r["commit"][:12])
+    shas = {t["path"]: t["sha"] for t in G.tree(i["token"], repo, branch)
+            if t["type"] == "blob"}
+    ok, total, bad = G.verify_mirror(args.dir, shas, ignore_extra=set(r["kept"]))
+    print("   逐字节校验 %d/%d %s" % (ok, total, "✅" if not bad else "❌ " + str(bad[:5])))
+    ghproj_write(args.dir, repo, branch, r["commit"])
+    return 0 if not bad else 1
+
+
+def cmd_ff(args):
+    i = ident(args, allow_anon=True)
+    guard(i, args.repo)
+    branch = ref_of(args, "branch")
+    cmp = G.compare(i["token"], args.repo, branch, args.head)
+    print("比对   %s...%s  ahead=%s behind=%s status=%s" %
+          (branch, args.head, cmp.get("ahead_by"), cmp.get("behind_by"), cmp.get("status")))
+    if cmp.get("behind_by") != 0 or cmp.get("ahead_by") != 1 or cmp.get("status") != "ahead":
+        raise G.GhError("不是单提交纯快进（ahead=1 behind=0）—— 停止，避免覆盖他人提交")
+    head = cmp["commits"][-1]["sha"]
+    if args.sha and not head.startswith(args.sha):
+        raise G.GhError("目标 %s 与 --sha %s 不符" % (head[:12], args.sha))
+    print("将快进 %s → %s (force=false)" % (branch, head[:12]))
+    if args.dry_run:
+        print("DRY-RUN：未调用 API")
+        return 0
+    old, new = G.fast_forward(i["token"], args.repo, branch, head, args.base)
+    print("✅ %s：%s → %s" % (branch, old[:12], new[:12]))
+    print("Pages 构建：")
+    G.poll_pages(i["token"], args.repo)
+    return 0
+
+
+def cmd_guide(args):
+    if args.list:
+        for base, dirs, files in os.walk(GUIDES):
+            for fn in sorted(files):
+                if fn.lower().endswith((".md", ".mdc", ".json")):
+                    print("  ", os.path.relpath(os.path.join(base, fn), GUIDES))
+        return 0
+    path = os.path.abspath(os.path.normpath(os.path.join(GUIDES, args.which)))
+    if os.path.commonpath([path, os.path.abspath(GUIDES)]) != os.path.abspath(GUIDES):
+        raise G.GhError("路径越界：%s（只能在 guides/ 内）" % args.which)
+    if not os.path.isfile(path):
+        raise G.GhError("没有 %s" % path)
+    with open(path, encoding="utf-8") as fh:
+        print(fh.read())
+    return 0
+
+
+def cmd_pages(args):
+    """查 Pages / 开 Pages / 等构建。一条龙的最后一步补齐。"""
+    i = ident(args, allow_anon=not args.enable)
+    repo = resolve_repo(args, i)
+    branch = ref_of(args, "branch")
+    if args.enable:
+        if not i["token"]:
+            raise G.GhError("开启 Pages 需要 .tokens（当前是匿名只读身份）")
+        print("身份   %s" % who(i))
+        print("★ 将开启 Pages  %s  branch=%s path=%s" % (repo, branch, args.path))
+        if args.dry_run:
+            print("DRY-RUN：未调用写 API")
+            return 0
+        d = G.pages_enable(i["token"], repo, branch, args.path)
+        if d.get("already_exists"):
+            print("ℹ️  Pages 已存在，跳过创建")
+        else:
+            print("✅ 已开启 Pages")
+    st, pg = G.pages(i["token"], repo)
+    if st == 200:
+        print("Pages  %s → %s  branch=%s" %
+              (pg.get("status"), pg.get("html_url"), (pg.get("source") or {}).get("branch")))
+    else:
+        print("Pages  (未启用 / HTTP %s)" % st)
+        return 0
+    st2, b = G.latest_build(i["token"], repo)
+    print("构建   %s commit=%s err=%s" %
+          (b.get("status"), str(b.get("commit"))[:12], (b.get("error") or {}).get("message")))
+    if args.wait:
+        print("等待落定：最终状态", G.poll_pages(i["token"], repo))
+    return 0
+
+
+# ---------------------------------------------------------------- sb3 适配
+# 全部本地执行：不解析账号、不调 GitHub API、不需要 token。
+# 与 doctor / guide 一样，匿名只读环境也能用。
+
+SB3_GUIDE = """sb3 = ZIP 包（不是代码文本）
+  project.json   程序：targets / monitors / extensions / meta
+  素材           按内容 MD5 命名，平铺在 ZIP 根目录（不能多一层文件夹）
+
+target（Stage 或 Sprite）
+  isStage name variables lists broadcasts blocks comments
+  currentCostume costumes sounds layerOrder volume
+  Sprite 另加 x y size direction visible draggable rotationStyle
+
+blocks 是图不是文本
+  ID -> {opcode, next, parent, inputs, fields, shadow, topLevel, x, y}
+  next / parent 必须双向一致；脚本从帽子块（topLevel）起步
+
+inputs 第一位是阴影状态，不是值
+  [1, X] 有阴影 / [2, id] 无阴影 / [3, id, shadowId] 阴影被覆盖
+  X 可为 blockId，或内联 primitive：
+    4 数字 5 正数 6 正整数 7 整数 8 角度 9 颜色
+    10 字符串 11 广播 12 变量 13 列表
+  例：移动 10 步 = inputs.STEPS = [1, [4, "10"]]（不是 fields！）
+  fields 用于下拉框等不能塞 reporter 的位置，格式 [值, id或null]
+
+资源对象
+  assetId + name + md5ext + dataFormat
+  造型再加 rotationCenterX/Y、bitmapResolution；声音再加 rate / sampleCount
+  md5ext = assetId + "." + dataFormat，assetId 通常就是文件内容 MD5
+  SVG 建议带 xmlns 与 viewBox，缺 viewBox 常被渲染成问号
+
+常见翻车
+  1 素材没平铺 -> 导入成功但角色是问号
+  2 next/parent 断链 -> 能导入但脚本不跑
+  3 把 fields 和 inputs 搞混 -> 空槽
+  4 用了扩展积木却没写 extensions -> 被静默丢弃
+  5 变量 ID 在 variables / fields / monitors.id 三处没对齐 -> 监视器乱码
+  6 自定义积木 mutation 漏写 proccode / argumentids -> 定义失效
+"""
+
+
+def cmd_sb3(args):
+    if SB3 is None:
+        raise G.GhError("找不到 sb3lib.py：请把它放在与 github 同一目录")
+    a = args.sb3_cmd
+    if a == "check":
+        errors, warnings, info, code = SB3.check(args.file)
+        if args.json:
+            print(json.dumps({"ok": code == 0, "info": info,
+                              "warnings": warnings, "errors": errors},
+                             ensure_ascii=False, indent=2))
+        else:
+            for x in info:
+                print("  · " + x)
+            for w in warnings:
+                print("  ⚠ 警告: " + w)
+            for e in errors:
+                print("  ❌ 错误: " + e)
+            print("=== 结果: %s（错误 %d / 警告 %d）===" %
+                  ("通过" if code == 0 else "未通过", len(errors), len(warnings)))
+        return 0 if code == 0 else 1
+    if a == "tree":
+        for line in SB3.tree(args.file):
+            print(line)
+        return 0
+    if a == "unpack":
+        n = SB3.unpack(args.file, args.dir)
+        print("✅ 解包 %s → %s（%d 个文件）" % (args.file, args.dir, n))
+        return 0
+    if a == "pack":
+        lines, code = SB3.pack(args.dir, args.out)
+        for line in lines:
+            print(line)
+        return 0 if code == 0 else 1
+    if a == "make":
+        lines, code = SB3.make(args.out)
+        for line in lines:
+            print(line)
+        return 0 if code == 0 else 1
+    if a == "guide":
+        print(SB3_GUIDE)
+        return 0
+    raise G.GhError("未知 sb3 子命令：%s" % a)
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--as", dest="as_spec", default=None,
+                        help="单次用哪个账号：login 或 .tokens 行号")
+    common.add_argument("--line", type=int, default=1, help="同 --as，按行号（兼容旧用法）")
+
+    p = argparse.ArgumentParser(prog="github",
+                                description="GitHub 操作 skill（v" + G.VERSION + "，多账号）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, **kw):
+        q = sub.add_parser(name, parents=[common], help=kw.pop("help", ""))
+        q.set_defaults(fn=fn)
+        return q
+
+    add("whoami", cmd_whoami, help="当前生效账号 / scope")
+    q = add("users", cmd_users, help="列出所有账号与权限（账号管理）")
+    q.add_argument("--repo", help="附带检查每个账号对该仓库的 push/admin 权限")
+    q = add("use", cmd_use, help="设默认账号写进 .active")
+    q.add_argument("spec", nargs="?", help="login 或行号")
+    q.add_argument("--clear", action="store_true", help="清除默认，回到第 1 行")
+    add("doctor", cmd_doctor, help="环境自检")
+    q = add("tree", cmd_tree, help="看文件树（仓库名可省，读 .ghproj；公开仓匿名可用）")
+    q.add_argument("repo", nargs="?"); q.add_argument("--ref", default=None); q.add_argument("--limit", type=int, default=40)
+    q = add("status", cmd_status, help="仓库 + Pages + 最新构建 + 我的权限（仓库名可省）")
+    q.add_argument("repo", nargs="?")
+    q = add("pr", cmd_pr, help="列 PR 与标签")
+    q.add_argument("repo"); q.add_argument("--state", default="open", choices=["open", "closed", "all"])
+    q = add("collab", cmd_collab, help="列协作者与权限")
+    q.add_argument("repo")
+    q = add("new", cmd_new, help="建仓并拉到 projects/（可写 `github new repo <名>`）")
+    q.add_argument("name"); q.add_argument("--private", action="store_true")
+    q.add_argument("--desc", default=""); q.add_argument("--no-init", action="store_true")
+    q.add_argument("--owner", help="建到指定组织名下（普通用户名请用 --as 切换账号）")
+    q.add_argument("--pages", action="store_true", help="建完直接开 Pages 并等构建")
+    q.add_argument("--dry-run", action="store_true")
+    q = add("clone", cmd_clone, help="git clone，403 自动回退 API 镜像")
+    q.add_argument("repo"); q.add_argument("dir", nargs="?"); q.add_argument("--ref", default=None)
+    q.add_argument("--zip", action="store_true", help="回退时用 zipball 一次拉全")
+    q = add("pull", cmd_pull, help="镜像拉取 + 逐字节校验（--zip 一次拿全仓）")
+    q.add_argument("repo"); q.add_argument("dir", nargs="?"); q.add_argument("--ref", default=None)
+    q.add_argument("--force", action="store_true")
+    q.add_argument("--zip", action="store_true", help="zipball 一次下载，避免逐文件 GET /contents")
+    q = add("verify", cmd_verify, help="本地目录 vs 线上 tree 逐字节校验（仓库名可省）")
+    q.add_argument("dir"); q.add_argument("--repo"); q.add_argument("--ref", default=None)
+    q.add_argument("--strict", action="store_true", help="线上多出文件也算不一致（默认合并语义容忍）")
+    q = add("push", cmd_push, help="推单个文件（自动带 sha，仓库名可省）")
+    q.add_argument("file"); q.add_argument("--repo"); q.add_argument("--path", required=True)
+    q.add_argument("-m", "--message", required=True); q.add_argument("--branch", default=None)
+    q.add_argument("--dry-run", action="store_true")
+    q = add("sync", cmd_sync, help="整目录一次 commit + 自动逐字节校验（默认合并语义）")
+    q.add_argument("dir", nargs="?", default="."); q.add_argument("--repo")
+    q.add_argument("-m", "--message", required=True); q.add_argument("--branch", default=None)
+    q.add_argument("--mirror", action="store_true",
+                   help="镜像模式：不带 base_tree，线上多出的文件会被删除（默认关闭）")
+    q.add_argument("--dry-run", action="store_true")
+    q = add("ff", cmd_ff, help="把分支纯快进到目标提交")
+    q.add_argument("repo"); q.add_argument("head"); q.add_argument("--branch", default=None)
+    q.add_argument("--sha", help="期望的 head 前缀，防串提交"); q.add_argument("--base", help="期望当前 main 前缀")
+    q.add_argument("--dry-run", action="store_true")
+    q = add("pages", cmd_pages, help="查 Pages / 开 Pages / 等构建（一条龙最后一步）")
+    q.add_argument("repo", nargs="?")
+    q.add_argument("--enable", action="store_true", help="POST /repos/{o/r}/pages 开启 Pages")
+    q.add_argument("--branch", default=None); q.add_argument("--path", default="/")
+    q.add_argument("--wait", action="store_true", help="轮询到 built/errored")
+    q.add_argument("--dry-run", action="store_true")
+    q = add("guide", cmd_guide, help="打印 guides/ 下任意文档（--list 看全部）")
+    q.add_argument("which", nargs="?", default="使用指南.md")
+    q.add_argument("--list", action="store_true", help="列出 guides/ 下所有文档")
+    # sb3 适配：本地命令组，不解析账号、不调 API、不需要 token
+    q = add("sb3", cmd_sb3, help="sb3 工具：check / tree / unpack / pack / make / guide")
+    s3 = q.add_subparsers(dest="sb3_cmd", required=True)
+    c = s3.add_parser("check", help="结构校验任意 .sb3")
+    c.add_argument("file"); c.add_argument("--json", action="store_true", help="机器可读输出")
+    c = s3.add_parser("tree", help="包内清单 + targets/blocks 概览")
+    c.add_argument("file")
+    c = s3.add_parser("unpack", help="解包成可编辑目录")
+    c.add_argument("file"); c.add_argument("dir", nargs="?", default="sb3_unpacked")
+    c = s3.add_parser("pack", help="目录 → sb3（自动重算 MD5、平铺、自检）")
+    c.add_argument("dir"); c.add_argument("-o", "--out", required=True)
+    c = s3.add_parser("make", help="生成可导入的最小示例 sb3")
+    c.add_argument("out", nargs="?", default="最小示例.sb3")
+    s3.add_parser("guide", help="打印 sb3 结构速查（内置，离线可用）")
+    return p
+
+
+def main():
+    argv = lift_as(sys.argv[1:])
+    # 兼容用户写法：github new repo <名> == github new <名>
+    if len(argv) >= 3 and argv[0] == "new" and argv[1] == "repo":
+        argv = [argv[0]] + argv[2:]
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args) or 0
+    except G.GhError as e:
+        print("❌", e, file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError) as e:
+        print("❌ %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Scratch VM · 可交互舞台</title>
+<link rel="icon" href="data:,">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: #10141c; color: #e8edf6;
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; justify-content: center;
+  }
+  .card { width: 520px; }
+  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: #8e9bb3; font-size: 12px; margin-bottom: 14px; }
+  .stage-wrap {
+    width: 480px; height: 360px;
+    border-radius: 10px; overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,.45); background: #fff;
+  }
+  canvas { display: block; width: 480px; height: 360px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  button, label.btn {
+    appearance: none; border: 1px solid #34425c; background: #1c2637;
+    color: #dce7f8; padding: 7px 12px; border-radius: 7px;
+    font-size: 13px; cursor: pointer; transition: .15s;
+  }
+  button:hover, label.btn:hover { background: #2a3a54; border-color: #4d6488; }
+  button:active { transform: translateY(1px); }
+  label.btn { display: inline-block; }
+  input[type=file] { display: none; }
+  .fname { color: #7f8da6; font-size: 12px; flex: 1 1 100%; }
+  .bar {
+    margin-top: 12px; padding: 10px 12px;
+    background: #1a2130; border: 1px solid #2a3448; border-radius: 8px;
+    font: 12px/1.8 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #a9d8ff; min-height: 76px;
+  }
+  .tag { color: #7f8da6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Scratch VM · 可交互舞台</h1>
+  <div class="sub">上传 sb3 → 绿旗 / 点击 → 看真实 VM 状态与舞台画面</div>
+  <div class="stage-wrap"><canvas id="stage" width="480" height="360"></canvas></div>
+
+  <div class="controls">
+    <label class="btn">📂 选择 sb3<input type="file" id="file" accept=".sb3"></label>
+    <button id="flag">🚩 绿旗</button>
+    <button id="click">👆 点击角色</button>
+    <button id="reload">⟳ 重载</button>
+    <span class="fname" id="fname">当前：最小示例.sb3</span>
+  </div>
+  <div class="bar" id="status">初始化…</div>
+</div>
+
+<script src="./vendor/scratch-storage.js"></script>
+<script src="./vendor/scratch-vm.js"></script>
+<script>
+window.__errors = [];
+window.__ready = false;
+window.addEventListener('error', e => window.__errors.push(String(e.message)));
+window.addEventListener('unhandledrejection', e => window.__errors.push(String(e.reason)));
+const log = (...a) => console.log('[player]', ...a);
+
+/* 本环境的无头 Chromium 无可用 WebGL，scratch-render 无法初始化。
+   用 stub renderer 满足 VM 运行时接口；舞台由本页按 VM 真实状态用 Canvas 2D 绘制。
+   VM 本身完整执行 sb3：blocks 反序列化、线程调度、积木语义都是真的。 */
+let nextId = 1;
+const special = {
+    _allDrawables: [],
+    createSVGSkin: () => nextId++,
+    createBitmapSkin: () => nextId++,
+    createTextSkin: () => nextId++,
+    createDrawable: () => nextId++,
+    getSkinSize: () => [96, 96],
+    getCurrentSkinSize: () => [96, 96],
+    getNativeSize: () => [96, 96],
+    getSkinRotationCenter: () => [48, 48],
+    getBounds: () => ({left: -48, right: 48, top: -48, bottom: 48}),
+    getBoundsForBubble: () => ({left: 0, right: 0, top: 0, bottom: 0}),
+    getFencedPositionOfDrawable: (id, pos) => pos,
+    getDrawableOrder: () => 0,
+    pick: () => {
+        const t = window.vm && window.vm.runtime.targets.find(t => !t.isStage);
+        return t ? t.drawableID : null;
+    },
+    drawableTouching: () => false,
+    isTouchingColor: () => false,
+    isTouchingDrawables: () => false,
+    offscreenTouching: () => false,
+    useHighQualityRender: false
+};
+const stubRenderer = new Proxy({}, {
+    get (t, k) {
+        if (k in special) return special[k];
+        if (typeof t[k] === 'function') return t[k];
+        t[k] = () => undefined;
+        return t[k];
+    },
+    set (t, k, v) { t[k] = v; return true; }
+});
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const vm = new VirtualMachine();
+window.vm = vm;
+vm.attachStorage(new ScratchStorage());
+vm.attachRenderer(stubRenderer);
+
+let bubbleText = '';
+vm.runtime.on('SAY', (target, type, message) => {
+    bubbleText = message || '';
+    log('bubble:', bubbleText);
+});
+
+/* ---------- 极简 ZIP 读取：直接从 sb3 里取 project.json 与素材 ---------- */
+async function readZip (buffer) {
+    const u8 = new Uint8Array(buffer);
+    const dv = new DataView(buffer);
+    let eocd = -1;
+    for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65558); i--) {
+        if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('找不到 ZIP 结束记录');
+    const count = dv.getUint16(eocd + 10, true);
+    let off = dv.getUint32(eocd + 16, true);
+    const files = {};
+    const dec = new TextDecoder();
+    for (let n = 0; n < count; n++) {
+        if (dv.getUint32(off, true) !== 0x02014b50) throw new Error('ZIP 中央目录损坏');
+        const method = dv.getUint16(off + 10, true);
+        const compSize = dv.getUint32(off + 20, true);
+        const nameLen = dv.getUint16(off + 28, true);
+        const extraLen = dv.getUint16(off + 30, true);
+        const commentLen = dv.getUint16(off + 32, true);
+        const localOff = dv.getUint32(off + 42, true);
+        const name = dec.decode(u8.subarray(off + 46, off + 46 + nameLen));
+        const lnLen = dv.getUint16(localOff + 26, true);
+        const lxLen = dv.getUint16(localOff + 28, true);
+        const start = localOff + 30 + lnLen + lxLen;
+        const comp = u8.subarray(start, start + compSize);
+        if (method === 0) {
+            files[name] = comp;
+        } else if (method === 8) {
+            const ds = new DecompressionStream('deflate-raw');
+            const stream = new Blob([comp]).stream().pipeThrough(ds);
+            files[name] = new Uint8Array(await new Response(stream).arrayBuffer());
+        } else {
+            throw new Error('不支持的 ZIP 压缩方式: ' + method);
+        }
+        off += 46 + nameLen + extraLen + commentLen;
+    }
+    return files;
+}
+
+/* ---------- 舞台绘制（素材与状态都来自当前 sb3 / VM） ---------- */
+const backdrop = new Image();
+const costume = new Image();
+let backdropReady = false, costumeReady = false;
+let costumeW = 96, costumeH = 96;
+backdrop.onload = () => { backdropReady = true; };
+costume.onload = () => {
+    costumeReady = true;
+    costumeW = costume.naturalWidth || 96;
+    costumeH = costume.naturalHeight || 96;
+};
+let objectUrls = [];
+function setImages (files, project) {
+    objectUrls.forEach(u => URL.revokeObjectURL(u));
+    objectUrls = [];
+    const blobUrl = (bytes, mime) => {
+        const u = URL.createObjectURL(new Blob([bytes], {type: mime}));
+        objectUrls.push(u);
+        return u;
+    };
+    const mime = (ext) => ext === 'svg' ? 'image/svg+xml' :
+        (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/' + ext);
+    const stage = project.targets.find(t => t.isStage) || project.targets[0];
+    const sprite = project.targets.find(t => !t.isStage);
+    const pick = (c) => {
+        if (!c) return null;
+        const bytes = files[c.md5ext];
+        if (!bytes) return null;
+        const ext = (c.dataFormat || c.md5ext.split('.').pop()).toLowerCase();
+        return blobUrl(bytes, mime(ext));
+    };
+    backdropReady = costumeReady = false;
+    const bg = pick((stage.costumes || [])[0]);
+    const sp = pick((sprite && sprite.costumes || [])[0]);
+    if (bg) backdrop.src = bg;
+    if (sp) costume.src = sp;
+}
+
+function roundRect (x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+}
+
+function drawStage () {
+    const t = vm.runtime.targets.find(t => !t.isStage);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, 480, 360);
+    if (backdropReady && backdrop.complete) ctx.drawImage(backdrop, 0, 0, 480, 360);
+    if (!t || !costumeReady) return;
+
+    const cx = 240 + t.x;
+    const cy = 180 - t.y;
+    const scale = (t.size || 100) / 100;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(((t.direction || 90) - 90) * Math.PI / 180);
+    ctx.scale(scale, scale);
+    ctx.drawImage(costume, -costumeW / 2, -costumeH / 2, costumeW, costumeH);
+    ctx.restore();
+
+    if (bubbleText) {
+        ctx.font = '16px "WenQuanYi Micro Hei", sans-serif';
+        const w = Math.max(90, ctx.measureText(bubbleText).width + 28);
+        const h = 38;
+        const bx = Math.min(480 - w - 6, cx + 30);
+        const by = Math.max(4, cy - costumeH / 2 - h);
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#c8cfdb';
+        ctx.lineWidth = 2;
+        roundRect(bx, by, w, h, 14);
+        ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx + 12, by + h - 1);
+        ctx.lineTo(cx + 2, by + h + 10);
+        ctx.lineTo(cx + 30, by + h - 1);
+        ctx.fillStyle = '#ffffff'; ctx.fill();
+        ctx.fillStyle = '#2b3244';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(bubbleText, bx + 14, by + h / 2 + 1);
+    }
+}
+setInterval(drawStage, 50);
+
+/* ---------- 加载 / 交互接口（capture.js 也调用这些） ---------- */
+let currentBuffer = null;
+
+async function loadBuffer (buffer, label) {
+    currentBuffer = buffer.slice(0);
+    const files = await readZip(buffer);
+    const projectJson = files['project.json'];
+    if (!projectJson) throw new Error('sb3 根目录缺 project.json');
+    const project = JSON.parse(new TextDecoder().decode(projectJson));
+    setImages(files, project);
+
+    vm.stopAll();
+    bubbleText = '';
+    window.__ready = false;
+    await vm.loadProject(buffer);
+    vm.start();
+    window.__ready = true;
+    document.getElementById('fname').textContent = '当前：' + label;
+    const t = vm.runtime.targets.find(t => !t.isStage);
+    log('loaded:', vm.runtime.targets.map(t => t.name || (t.sprite && t.sprite.name)).join(', '),
+        'blocks:', t ? Object.keys(t.blocks._blocks).length : 0);
+    return true;
+}
+
+window.__load = async function (url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('fetch ' + url + ' -> ' + res.status);
+    return loadBuffer(await res.arrayBuffer(), url.split('/').pop());
+};
+window.__loadFile = function (file) {
+    return file.arrayBuffer().then(buf => loadBuffer(buf, file.name));
+};
+window.__greenFlag = function () { vm.greenFlag(); };
+window.__click = function (x, y) {
+    const base = {x: x, y: y, canvasWidth: canvas.width, canvasHeight: canvas.height};
+    vm.postIOData('mouse', Object.assign({}, base, {isDown: true}));
+    vm.postIOData('mouse', Object.assign({}, base, {isDown: false}));
+};
+window.__state = function () {
+    const t = vm.runtime.targets.find(t => !t.isStage);
+    return {
+        ready: window.__ready,
+        name: (t && (t.name || (t.sprite && t.sprite.name))) || 'Sprite1',
+        x: t && t.x, y: t && t.y,
+        direction: t && t.direction,
+        bubble: bubbleText,
+        blocks: t ? Object.keys(t.blocks._blocks).length : 0,
+        costumes: t ? t.getCostumes().length : 0,
+        threads: vm.runtime.threads.length,
+        errors: window.__errors.slice()
+    };
+};
+
+const statusEl = document.getElementById('status');
+function paint () {
+    const s = window.__state();
+    statusEl.innerHTML =
+      '<span class="tag">角色 </span>' + s.name +
+      '   <span class="tag">x/y </span>' + s.x + ',' + s.y +
+      '   <span class="tag">方向 </span>' + s.direction + '<br>' +
+      '<span class="tag">积木 </span>' + s.blocks +
+      '  <span class="tag">造型 </span>' + s.costumes +
+      '  <span class="tag">线程 </span>' + s.threads +
+      '  <span class="tag">气泡 </span>' + (s.bubble || '-') + '<br>' +
+      '<span class="tag">状态 </span>' + (s.ready ? '已加载' : '加载中') +
+      (s.errors.length ? '  <span style="color:#ff8f8f">错误: ' + s.errors.join('; ') + '</span>' : '');
+}
+setInterval(paint, 200);
+
+document.getElementById('flag').onclick = () => window.__greenFlag();
+document.getElementById('click').onclick = () => window.__click(250, 180);
+document.getElementById('reload').onclick = async () => {
+    if (!currentBuffer) return;
+    try { await loadBuffer(currentBuffer.slice(0), document.getElementById('fname').textContent.replace('当前：', '')); }
+    catch (e) { window.__errors.push(String(e)); }
+};
+document.getElementById('file').onchange = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try { await window.__loadFile(f); paint(); }
+    catch (err) { window.__errors.push(String(err)); statusEl.textContent = '加载失败: ' + err; }
+};
+
+(async () => {
+    try { await window.__load('./最小示例.sb3'); paint(); }
+    catch (e) { window.__errors.push(String(e)); statusEl.textContent = '加载失败: ' + e; }
+})();
+</script>
+</body>
+</html>
