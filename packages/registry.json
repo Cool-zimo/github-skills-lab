@@ -1,0 +1,30 @@
+{
+  "registry": "Cool-zimo/spm-packages",
+  "schema": 1,
+  "path": "packages",
+  "default_source": {
+    "type": "github",
+    "repo": "Cool-zimo/spm-packages",
+    "ref": "main",
+    "path": "packages"
+  },
+  "note": "spm 默认从这里下载。install 不写 --from / --source 时按包名前缀挑对应的 zip；想换源用 spm source use <name> 或 install --from <spec>。",
+  "packages": [
+    {
+      "name": "github-skills",
+      "latest": "1.3.2",
+      "file": "github-skills.v.1.3.2.zip",
+      "bytes": 81003,
+      "description": "GitHub 一条龙 CLI：多账号、clone/pull/sync/verify/push/pages/pr --merge。纯包，不含 spm。",
+      "install": "spm install github-skills"
+    },
+    {
+      "name": "sb3",
+      "latest": "1.0.0",
+      "file": "sb3.v.1.0.0.zip",
+      "bytes": 5087362,
+      "description": "Scratch .sb3 工具链：make/check/tree/unpack/pack/guide + 交互播放器与 VM vendor。",
+      "install": "spm install sb3"
+    }
+  ]
+}

@@ -281,7 +281,7 @@ class TestAliasTokenCLI(Base):
 
     def test_25_cli_full_workflow(self):
         txt = self.cli("doctor")
-        self.assertIn("skillpm v1.0.0", txt)
+        self.assertIn("skillpm v1.1.0", txt)
         self.cli("source", "add", "local", "path:" + self.src)
         self.assertIn("local", self.cli("source", "list"))
         self.install("1.2.0")

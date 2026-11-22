@@ -1,7 +1,9 @@
 # skillpm · GitHub skill 包管理器
 
-一个自包含的包管理器，随 `github-skills.v.1.3.0.zip` 一起分发，**默认装到 skill 上**
-（`SPM_HOME` 默认是包内 `skills/`）。也可以单独把 `spm` + `spmlib/` 拷走用，零第三方依赖。
+一个**独立的包管理器**（v1.1.0），不随任何包分发：`spm` + `spmlib/` 拷走即用，零第三方依赖。
+默认从官方包仓库 `Cool-zimo/spm-packages` 的 `packages/` 目录下载，装到 `skills/`（`SPM_HOME`）。
+
+> 角色分工：**spm = 包管理器**；`github-skills`、`sb3` = 包。一个源里按包名前缀自动挑文件。
 
 ## 一句话能力
 
@@ -26,7 +28,7 @@
 ```bash
 python3 spm doctor
 python3 spm install github-skills@1.2.0 --trust --allow python3 --script "check=python3 github --help"
-python3 spm install github-skills@1.3.0 --from pr:Cool-zimo/github-skills-lab#1:downloads
+python3 spm install github-skills --from pr:Cool-zimo/spm-packages#1:packages
 python3 spm list
 python3 spm alias add v12 "run github-skills@1.2.0 check"
 python3 spm v12
@@ -44,7 +46,7 @@ python3 spm verify github-skills@1.2.0
 ## 与 github-skills 的关系
 
 - `spm` 复用同一份 `.tokens` / `.token`（向上 4 层查找），装完自动同步到各版本 `.spm/token`
-- 默认源就是 `Cool-zimo/github-skills-lab` 的 `downloads/`，所以能直接装 1.2.0 / 1.3.0 并存
+- 默认源 `official` 就是 `Cool-zimo/spm-packages@main:packages`，`github-skills` / `sb3` 都能直接装
 - 不依赖 `ghlib.py`：`spmlib/_gh.py` 自带极简 GitHub 客户端，单独拷走也能装公开仓
 - 配合 v1.3.0 的 `github pages / --zip / 匿名只读 / sync 合并语义`，开发者可以在隔离环境里改 skill、验 sha、再推 PR
 

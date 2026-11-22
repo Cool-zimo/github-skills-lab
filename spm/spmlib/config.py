@@ -15,22 +15,37 @@ DEFAULT_TOKEN_FILE = os.path.join(os.path.dirname(PKG_ROOT), ".tokens")
 DEFAULT_CONFIG = {
     "version": 1,
     "safe_mode": True,
-    "default_source": "lab",
+    "default_source": "official",
     "token_file": DEFAULT_TOKEN_FILE,
     "token_sync_target": ".spm/token",
     "sources": {
-        # 默认源：演示仓里托管的工具包 zip，开箱即可装 1.2.0 / 1.3.0 两个版本
-        "lab": {
+        # 默认源：官方包仓库的 packages/ 目录。不写 pattern，
+        # install 时按「包名前缀」自动挑对应的 zip，所以一个源能放多个包。
+        "official": {
             "type": "github",
-            "repo": "Cool-zimo/github-skills-lab",
+            "repo": "Cool-zimo/spm-packages",
             "ref": "main",
-            "path": "downloads",
-            "pattern": "github-skills.v.*.zip",
+            "path": "packages",
         }
     },
     "aliases": {},
     "scripts": {},
 }
+
+OLD_REPO = "Cool-zimo/github-skills-lab"
+NEW_REPO = "Cool-zimo/spm-packages"
+
+
+def _migrate(cfg):
+    """仓库改名后，把指向旧仓库的默认源迁到新包仓库。只动这一处。"""
+    name = cfg.get("default_source")
+    s = (cfg.get("sources") or {}).get(name)
+    if not s or s.get("repo") != OLD_REPO:
+        return False
+    cfg.setdefault("sources", {})["official"] = {
+        "type": "github", "repo": NEW_REPO, "ref": "main", "path": "packages"}
+    cfg["default_source"] = "official"
+    return True
 
 
 def home():
@@ -58,6 +73,8 @@ def load(h=None):
         if k not in cfg:
             cfg[k] = json.loads(json.dumps(v))
             changed = True
+    if _migrate(cfg):
+        changed = True
     if changed:
         save(cfg, h)
     # 记住这份配置来自哪个 home，save() 不带 h 时写回原处，避免跨 home 污染

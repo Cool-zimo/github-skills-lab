@@ -1,7 +1,7 @@
 # 使用 spm · GitHub skill 包管理器
 
-> 零第三方依赖、Python 3.8+。`spm` 随 `github-skills.v.1.3.0.zip` 一起分发，解压就能用；
-> 也可以单独把 `spm` + `spmlib/` 拷走，**不需要 github-skills 也能跑**（`spmlib/_gh.py` 自带极简 GitHub 客户端）。
+> 零第三方依赖、Python 3.8+。`spm` 是独立包管理器（不再随任何包分发），拷走 `spm` + `spmlib/` 就能用，
+> **不需要 github-skills 也能跑**（`spmlib/_gh.py` 自带极简 GitHub 客户端）。
 
 ## 0. 默认装到 skill 上
 
@@ -16,13 +16,13 @@ github-skills/
 └── guides/使用spm.md
 ```
 
-`SPM_HOME` 环境变量可改到别处；不写就是包内 `skills/`。默认源 `lab` 指向
-`Cool-zimo/github-skills-lab@main:downloads` 里的 `github-skills.v.*.zip`，所以**开箱即可同时装 1.2.0 / 1.3.0 两个版本**。
+`SPM_HOME` 环境变量可改到别处；不写就是包内 `skills/`。默认源 `official` 指向 `Cool-zimo/spm-packages@main:packages`。
+源不写 `pattern` 时按**包名前缀**挑文件，所以一个目录能同时放 `github-skills` 和 `sb3` 两个包。
 
 ```bash
 python3 spm doctor                 # 自检：SPM_HOME / 安全模式 / token / 已装版本
 python3 spm install github-skills@1.2.0
-python3 spm install github-skills@1.3.0 --from pr:Cool-zimo/github-skills-lab#1:downloads
+python3 spm install github-skills@1.3.0 --from pr:Cool-zimo/spm-packages#1:packages
 python3 spm list
 ```
 
@@ -32,11 +32,11 @@ python3 spm list
 
 ```bash
 spm source list
-spm source add lab github:Cool-zimo/github-skills-lab@main:downloads --default
-spm source add fork github:Feng-zimo/github-skills-lab@feat-v1.3.0:downloads
+spm source add lab github:Cool-zimo/spm-packages@main:packages --default
+spm source add fork github:me/my-fork@dev:packages
 spm source add mirror url:https://example.com/github-skills.v.1.3.0.zip#sha256=abcd...
 spm source add local path:/home/me/my-skill
-spm source add review pr:Cool-zimo/github-skills-lab#1:downloads
+spm source add review pr:Cool-zimo/spm-packages#1:packages
 spm source show review
 spm source rm mirror
 ```
@@ -53,7 +53,7 @@ spm source rm mirror
 `install --pr N` 也可以临时把任意源换成 PR head：
 
 ```bash
-spm install my-skill@review --from github:Cool-zimo/github-skills-lab@main:downloads --pr 1
+spm install my-skill@review --from github:Cool-zimo/spm-packages@main:packages --pr 1
 ```
 
 ---
@@ -62,7 +62,7 @@ spm install my-skill@review --from github:Cool-zimo/github-skills-lab@main:downl
 
 ```bash
 spm install github-skills@1.2.0 --trust --allow python3 --script "check=python3 github --help"
-spm install github-skills@1.3.0 --from github:Cool-zimo/github-skills-lab@main:downloads
+spm install github-skills@1.3.0 --from github:Cool-zimo/spm-packages@main:packages
 spm list                       # * 标当前版本
 spm use github-skills@1.2.0    # 切当前版本
 spm dir github-skills@1.3.0    # 打印版本目录（给脚本用）
@@ -209,7 +209,7 @@ python3 spm source list
 python3 spm install github-skills@1.2.0 --trust --allow python3 \
     --script "check=python3 github --help"
 python3 spm install github-skills@1.3.0 \
-    --from pr:Cool-zimo/github-skills-lab#1:downloads
+    --from pr:Cool-zimo/spm-packages#1:packages
 
 python3 spm list
 python3 spm alias add v12 "run github-skills@1.2.0 check"

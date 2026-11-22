@@ -2,10 +2,12 @@
 """skillpm · GitHub skill 包管理器（零第三方依赖，Python 3.8+）
 
     python3 spm doctor
-    python3 spm source list
-    python3 spm install github-skills@1.2.0 --trust --allow python3
-    python3 spm install github-skills@1.3.0 --from pr:Cool-zimo/github-skills-lab#1 --trust
-    python3 spm use github-skills@1.2.0
+    python3 spm source list                    # 默认源 = 官方包仓库
+    python3 spm install github-skills           # 一个源里按包名自动挑
+    python3 spm install sb3
+    python3 spm source add mirror github:me/mirror@main:packages --default
+    python3 spm source use official             # 换回官方源
+    python3 spm use github-skills@1.3.2
     python3 spm alias add gs "exec github-skills -- python3 github --help"
     python3 spm gs
 """
@@ -21,7 +23,7 @@ sys.path.insert(0, HERE)
 
 from spmlib import _gh, aliases, config, fetch, sandbox, sources, tokens, versions  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 COMMANDS = {
     "doctor", "source", "install", "list", "show", "use", "uninstall",
     "trust", "untrust", "safe", "mode", "allow", "dir", "verify",
@@ -66,6 +68,15 @@ def cmd_source(args):
         config.save(cfg)
         out("✅ 源 %s → %s" % (args.name, sources.describe(src)))
         return 0
+    if args.action == "use":
+        if args.name not in (cfg.get("sources") or {}):
+            out("没有源 %s（用 source list 看）" % args.name, file=sys.stderr)
+            return 1
+        cfg["default_source"] = args.name
+        config.save(cfg)
+        out("✅ 默认源 → %s  %s" %
+            (args.name, sources.describe(cfg["sources"][args.name])))
+        return 0
     if args.action == "rm":
         if args.name not in (cfg.get("sources") or {}):
             out("没有源 %s" % args.name, file=sys.stderr)
@@ -84,7 +95,7 @@ def cmd_source(args):
 
 
 # ---------------------------------------------------------------- install
-def _pick_file(src, version, filename, token):
+def _pick_file(src, name, version, filename, token):
     if src["type"] != "github":
         return None
     files = sources.list_github_files(src, token)
@@ -100,15 +111,19 @@ def _pick_file(src, version, filename, token):
     for f in files:
         if not f["name"].endswith((".zip", ".tar.gz", ".tgz", ".md", ".py")):
             continue
-        if pat and not re.match(re.escape(pat).replace(r"\*", ".*") + "$", f["name"]):
+        if pat:
+            if not re.match(re.escape(pat).replace(r"\*", ".*") + "$", f["name"]):
+                continue
+        elif not f["name"].startswith(name):
+            # 一个源里放多个包：没写 pattern 就按包名前缀区分
             continue
         v = fetch.guess_version(f["name"])
         if version and v != version:
             continue
         cand.append((v or "", f["name"]))
     if not cand:
-        raise fetch.FetchError("没找到匹配的版本包（version=%r, pattern=%r）" %
-                               (version, pat))
+        raise fetch.FetchError("没找到包 %s（version=%r, pattern=%r）" %
+                               (name, version, pat))
     cand.sort()
     return cand[-1][1]
 
@@ -127,7 +142,7 @@ def cmd_install(args):
     out("源     %s" % sources.describe(src))
     out("版本   %s@%s" % (name, version or "(自动)"))
 
-    rel = _pick_file(src, version, args.file, token()) if src["type"] == "github" else None
+    rel = _pick_file(src, name, version, args.file, token()) if src["type"] == "github" else None
     if rel:
         out("文件   %s" % rel)
     data = fetch.download(src, token(), rel=rel)
@@ -450,7 +465,7 @@ def build_parser():
     add("doctor", cmd_doctor, "环境自检（不回显 token）")
 
     q = add("source", cmd_source, "管理下载源")
-    q.add_argument("action", choices=["list", "add", "rm", "show"])
+    q.add_argument("action", choices=["list", "add", "rm", "show", "use"])
     q.add_argument("name", nargs="?")
     q.add_argument("spec", nargs="?")
     q.add_argument("--default", action="store_true")
