@@ -148,5 +148,26 @@ class TestSwitchSource(Base):
         self.assertIn("use", out.getvalue())
 
 
+class TestAsVersion(Base):
+    def test_12_explicit_as_version_beats_filename_guess(self):
+        """path/url 源文件名带版本号时，--as-version 不能被自动探测盖掉。"""
+        import subprocess
+        import zipfile
+        pkgdir = os.path.join(self.tmp, "mirror")
+        os.makedirs(pkgdir)
+        zp = os.path.join(pkgdir, "demo.v.1.0.0.zip")
+        with zipfile.ZipFile(zp, "w") as z:
+            z.writestr("demo/SKILL.md", "# demo\n")
+            z.writestr("demo/tool.py", "print('ok')\n")
+        env = dict(os.environ, SPM_HOME=self.home)
+        r = subprocess.run(
+            [sys.executable, CLI_PATH, "install", "demo",
+             "--from", "path:" + zp, "--as-version", "9.9.9"],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("demo@9.9.9", r.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "demo", "9.9.9", "SKILL.md")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

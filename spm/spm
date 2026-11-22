@@ -149,8 +149,10 @@ def cmd_install(args):
     out("下载   %d 字节  sha256=%s" % (len(data), fetch.sha256(data)[:12]))
 
     if not version:
-        version = (fetch.guess_version(rel or src.get("url", "") or src.get("path", ""))
-                   or args.as_version or "latest")
+        # 显式 --as-version 优先：否则 path/url 源的文件名会把用户指定的版本盖掉
+        version = (args.as_version
+                   or fetch.guess_version(rel or src.get("url", "") or src.get("path", ""))
+                   or "latest")
     versions.check(name, version)
     root = versions.root(name, version)
     if os.path.isdir(root) and os.path.isfile(versions.meta_path(name, version)):

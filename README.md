@@ -46,6 +46,8 @@ python3 spm install github-skills --from pr:Cool-zimo/spm-packages#3
 ```
 
 源里若写了 `pattern`，仍按 pattern 挑（兼容老配置）；没写就按包名前缀。
+`path:` 源指向**目录**时按「目录即包内容」打包；要装一个 zip 包，让 `path:` 指向那个 zip 文件
+或改用 `url:` 直链。文件名自带版本号时，可用 `--as-version <ver>` 覆盖自动探测。
 
 ## 目录
 
@@ -61,6 +63,7 @@ python3 spm install github-skills --from pr:Cool-zimo/spm-packages#3
 
 ## 版本历史
 
+- `spm` v1.1.0 — 独立包管理器；默认源指向本仓库、按包名前缀挑包、`source use` 换源；41 项回归
 - `github-skills.v.1.3.2.zip` — 拆出 spm，纯包；32 项回归
 - `github-skills.v.1.3.1.zip` — 修大文件静默写空包、`pr --merge`；61 项回归
 - `github-skills.v.1.3.0.zip` — 合并语义 `sync`、`pull --zip`、匿名只读、`pages`
@@ -69,9 +72,10 @@ python3 spm install github-skills --from pr:Cool-zimo/spm-packages#3
 
 ## 改名说明
 
-本仓库原名 `Cool-zimo/github-skills-lab`。改成 `spm-packages` 后，
-**旧的 `raw.githubusercontent.com/.../github-skills-lab/...` 直链失效**，
-请用下面新链接；仓库网页 URL 会自动跳转。
+本仓库原名 `Cool-zimo/github-skills-lab`。改成 `spm-packages` 后，实测
+**旧的 `raw.githubusercontent.com/.../github-skills-lab/...` 直链仍然 200 且内容一致**
+（GitHub 保留旧名映射），仓库网页 URL 也会自动跳转。所以之前发出去的链接不会立刻断，
+但新东西一律用 `spm-packages`，免得哪天映射策略变了。
 
 ## 下载
 
