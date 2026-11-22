@@ -15,14 +15,17 @@ github pages --enable --wait                               # 一条龙最后一�
 
 ```
 python -m unittest -q                          → Ran 3 tests OK
-python3 -m unittest discover -s tests -v      → Ran 49 tests OK（工具包内：24 + spm 25）
+python3 -m unittest discover -s tests -v      → Ran 61 tests OK（工具包内：36 + spm 25）
 ```
 
 按 karpathy 四条：先写复现测试、只写解决问题的最少代码、不碰无关文件、每步带验证点。
 
 ## 交付包
 
-- `downloads/github-skills.v.1.3.0.zip` —— 当前工具包，含 6 条实测优化 + **内置包管理器 `spm`**。
+- `downloads/github-skills.v.1.3.1.zip` —— **当前工具包**：修掉 >1 MB 大文件静默写空包，新增 `github pr --merge`。
+  可用 `https://raw.githubusercontent.com/Cool-zimo/github-skills-lab/main/downloads/github-skills.v.1.3.1.zip` 直接下载；
+  逐条改动见 `downloads/CHANGES-v1.3.1.md`（61 项离线回归全绿）。
+- `downloads/github-skills.v.1.3.0.zip` —— 上一版工具包，含 6 条实测优化 + **内置包管理器 `spm`**。
   可用 `https://raw.githubusercontent.com/Cool-zimo/github-skills-lab/main/downloads/github-skills.v.1.3.0.zip` 直接下载。
 - `downloads/github-skills.v.1.2.0.zip` —— 上一版，保留供对照。
 - `downloads/CHANGES-v1.3.0.md` —— 逐条改动、验证点与兼容性说明。

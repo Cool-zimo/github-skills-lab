@@ -120,4 +120,24 @@ def github_raw(src, rel, token):
     if st != 200:
         raise SourceError("下载 %s → HTTP %s %s" % (full, st, d.get("message", "")))
     import base64
-    return base64.b64decode(d.get("content") or "")
+    size = d.get("size") or 0
+    content = d.get("content")
+    if content and d.get("encoding") == "base64":
+        data = base64.b64decode(content + "=" * (-len(content) % 4))
+    elif not size:
+        data = b""
+    else:
+        # /contents 对 >1MB 文件返回 encoding:none + 空 content，只给 sha / git_url
+        sha = d.get("sha")
+        if not sha:
+            raise SourceError("下载 %s → 声明 %s 字节但无内容且无 sha" % (full, size))
+        st2, b = G.req("GET", "/repos/%s/git/blobs/%s" % (src["repo"], sha), token)
+        if st2 != 200 or not b.get("content"):
+            raise SourceError("下载 %s → blob HTTP %s %s" % (full, st2, b.get("message", "")))
+        c = b["content"]
+        data = base64.b64decode(c + "=" * (-len(c) % 4))
+    if size and not data:
+        raise SourceError("下载 %s → 声明 %s 字节但取回 0 字节，拒绝静默装空包" % (full, size))
+    if size and len(data) != size:
+        raise SourceError("下载 %s → 字节数不符：声明 %s 实得 %s" % (full, size, len(data)))
+    return data

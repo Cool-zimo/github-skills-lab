@@ -311,7 +311,18 @@ def pull_repo(token, full, dest, ref="main"):
     for t in items:
         path = t["path"]
         d = contents(token, full, path, ref)
-        raw = base64.b64decode(d.get("content", "") + "=" * (-len(d.get("content", "")) % 4))
+        enc = d.get("encoding")
+        if enc == "base64" and d.get("content"):
+            raw = base64.b64decode(d["content"] + "=" * (-len(d["content"]) % 4))
+        elif not d.get("size"):
+            raw = b""
+        else:
+            st, b = req("GET", "/repos/%s/git/blobs/%s" % (full, t["sha"]), token)
+            if st != 200 or not b.get("content"):
+                raise GhError("大文件取回失败：%s HTTP %s %s" % (path, st, b.get("message", "")))
+            raw = base64.b64decode(b["content"] + "=" * (-len(b["content"]) % 4))
+        if blob_sha(raw) != t["sha"]:
+            raise GhError("取回内容与 tree sha 不符：%s" % path)
         out = os.path.join(dest, path)
         parent = os.path.dirname(out)
         if parent:
